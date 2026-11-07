@@ -1,0 +1,33 @@
+
+# Python files
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# IntelliJ / PyCharm
+.idea/
+
+# Mac files
+.DS_Store
+
+# Generated database and downloads
+data/
+downloads/
+
+# Logs and temporary files
+*.log
+*.tmp
+
+# Local secrets
+.env
+.env.*
+
+# Future SQLite databases
+*.sqlite3
+*.db
+

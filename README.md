@@ -60,12 +60,6 @@ Coen366-project/
 
 Other modules and tests will be added as later phases are implemented.
 
-## Requirements
-
-- Python 3 (development is currently being done with Python 3.13).
-- No external Python packages are required for the current Phase 1 starter; it uses Python's standard library.
-- IntelliJ IDEA with Python support, PyCharm, VS Code, or a terminal.
-
 ## Run the project locally
 
 Run these commands **from the project root** (`Coen366-project`), not from inside `server/` or `client/`.

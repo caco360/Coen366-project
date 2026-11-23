@@ -145,3 +145,50 @@ The server prints received messages, sent replies, and errors in its terminal. T
 5. Do not commit temporary runtime data, virtual environments, passwords, or editor-specific files.
 
 **Note:** This repository is a work in progress, not the finished COEN 366 submission.
+
+## Phase 2 — Emergency notification and reliability (server side)
+
+Phase 2 adds alert publishing, distribution to matching subscribers, ACK timers with
+retransmission, incident update and close, and user status reports. Nothing in Phase 1
+was changed: `common/protocol.py` and `client/demo_client.py` are untouched, and
+`server/server.py` and `server/storage.py` only gained new entries and methods.
+
+### New and extended files
+
+| File | Role |
+|---|---|
+| `common/config.py` | Added `LOSS_RATE` (simulated loss of fan-out packets, default 0.0). `ACK_TIMEOUT` and `MAX_ATTEMPTS` were already there. |
+| `server/storage.py` | Added incidents, a persisted incident counter (`INC001`, `INC002`, ...), ACK delivery states and status reports, all behind the existing lock and atomic save. |
+| `server/reliability.py` | `TimerManager`: one `threading.Timer` per pending delivery, retransmission, duplicate ACK detection. |
+| `server/handlers/incidents.py` | `PUBLISH_ALERT`, `UPDATE_ALERT`, `CLOSE_ALERT`, subscription matching with the `ALL` wildcard, fan-out. |
+| `server/handlers/acks.py` | `ALERT_ACK`. |
+| `server/handlers/status.py` | `STATUS_REPORT`. |
+| `server/server.py` | Registers the new handlers in the existing dispatch dictionary, creates the `TimerManager`, adds the Phase 2 denial replies. |
+| `client/phase2_test_client.py` | Small UDP peer helper used by the demo. |
+| `tests/test_reliability.py` | 14 in-process tests (no sockets). |
+| `tests/run_phase2_demo.py` | Scripted multi-client demonstration. |
+
+### Behaviour
+
+- Only a registered `PUBLISHER` or `BOTH` can publish. The reply `ALERT_ACCEPTED` is sent first, then an `ALERT` with a fresh server RQ# goes to every registered `SUBSCRIBER`/`BOTH` whose subscription matches (`ALL` matches any location or category).
+- `CRITICAL` alerts, `CRITICAL` updates and every `ALL_CLEAR` require an `ALERT_ACK` echoing the RQ# of the message received. Without an ACK within `ACK_TIMEOUT` the identical packet is resent, up to `MAX_ATTEMPTS` total transmissions, then the delivery is recorded as `UNCONFIRMED`. A duplicate or stale ACK is logged and ignored.
+- Only the publisher that created an incident may update or close it, and only while it is `ACTIVE`. Each update or close increments the version.
+- `STATUS_REPORT` is accepted from a registered client for an `ACTIVE` incident; only the latest status per (incident, client) is kept.
+- Denial reasons: `Not_Registered`, `Unauthorized_Role`, `Unknown_Incident`, `Incident_Closed`, `Not_Owner`, `Name_Mismatch`. Malformed messages are handled by the Phase 1 code.
+- Direct replies (`ALERT_ACCEPTED`, `ALERT_DENIED`, `ALERT_UPDATED`, `ALERT_CLOSED`, `STATUS_RECORDED`, `STATUS_REJECTED`) are never subject to `LOSS_RATE`; only fan-out messages and retransmissions are.
+
+### Assumptions
+
+- Timeout 3 s and 3 total attempts (`common/config.py`).
+- A client is identified by its UDP address, as in Phase 1. After a server restart the online table is empty, so a client must re-register before publishing or reporting; otherwise it receives `Not_Registered`.
+- Fan-out targets every registered user on disk whose role and subscription match.
+- `ALL_CLEAR` carries the message `Incident closed: <reason>` and also reaches every client that received the original `ALERT`.
+- Timers do not survive a restart. On load, deliveries still `PENDING` are rewritten as `UNCONFIRMED_RESTART` and the count is logged.
+
+### Commands
+
+```bash
+python -m unittest discover -s tests -v     # 29 tests
+python -m tests.run_phase2_demo             # server + publisher + two subscribers, in one process
+python -m server.server                     # manual run; drive it with client/phase2_test_client.py
+```

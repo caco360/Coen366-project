@@ -15,6 +15,10 @@ from common.protocol import (
     decode_message,
     encode_message,
 )
+from server.handlers.acks import AckHandler
+from server.handlers.incidents import IncidentHandlers
+from server.handlers.status import StatusHandler
+from server.reliability import TimerManager
 from server.storage import Storage
 
 
@@ -35,6 +39,11 @@ DENIAL_TYPES = {
     "REGISTER": "REGISTER-DENIED",
     "SUBSCRIBE": "SUBSCRIPTION-DENIED",
     "UNSUBSCRIBE": "SUBSCRIPTION-DENIED",
+    # Phase 2
+    "PUBLISH_ALERT": "ALERT_DENIED",
+    "UPDATE_ALERT": "ALERT_DENIED",
+    "CLOSE_ALERT": "ALERT_DENIED",
+    "STATUS_REPORT": "STATUS_REJECTED",
 }
 
 
@@ -58,6 +67,20 @@ class EmergencyServer:
             "UNSUBSCRIBE": self.unsubscribe,
             "DE-REGISTER": self.deregister,
         }
+
+        # Phase 2: ACK timers and the handlers that use them
+        self.timers = TimerManager(self.storage, self.socket.sendto)
+        incidents = IncidentHandlers(self.storage, self.timers, self.send)
+        acks = AckHandler(self.timers)
+        status = StatusHandler(self.storage)
+
+        self.handlers.update({
+            "PUBLISH_ALERT": incidents.handle_publish,
+            "UPDATE_ALERT": incidents.handle_update,
+            "CLOSE_ALERT": incidents.handle_close,
+            "ALERT_ACK": acks.handle_ack,
+            "STATUS_REPORT": status.handle_status,
+        })
 
     # -----------------------------------
     # Send a response to a client
@@ -216,6 +239,7 @@ class EmergencyServer:
             log.info("Server shutting down")
 
         finally:
+            self.timers.shutdown()
             self.workers.shutdown(wait=True)
             self.socket.close()
 

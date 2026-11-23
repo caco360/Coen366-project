@@ -12,3 +12,7 @@ ROLES = ["SUBSCRIBER", "PUBLISHER", "BOTH"]
 USER_STATUSES = ["SAFE", "NEED_HELP", "LEFT_AREA"]
 
 DB_PATH = "cenrs.db"
+
+# Phase 2: probability of dropping an outgoing ALERT / ALERT_UPDATE / ALL_CLEAR
+# (fan-out and retransmissions only, never direct replies). Used to demo retransmission.
+LOSS_RATE = 0.0

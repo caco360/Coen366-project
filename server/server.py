@@ -7,6 +7,7 @@ import socket
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from common.net import disable_udp_connreset
 from common.protocol import (
     VALID_CATEGORIES,
     VALID_LOCATIONS,
@@ -55,6 +56,7 @@ class EmergencyServer:
 
         # Create the UDP socket
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        disable_udp_connreset(self.socket)   # a client that quit must not crash the loop
         self.socket.bind((host, port))
 
         # Allow multiple requests to be processed simultaneously
@@ -232,7 +234,10 @@ class EmergencyServer:
 
         try:
             while True:
-                data, address = self.socket.recvfrom(65535)
+                try:
+                    data, address = self.socket.recvfrom(65535)
+                except ConnectionResetError:
+                    continue   # stale ICMP error from an earlier send; UDP keeps going
                 self.workers.submit(self.handle, data, address)
 
         except KeyboardInterrupt:

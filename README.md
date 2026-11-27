@@ -49,7 +49,8 @@ Coen366-project/
 │   └── storage.py          # JSON-file persistence
 ├── client/
 │   ├── __init__.py
-│   ├── client.py           # Interactive client: Client class (UDP) + command shell
+│   ├── client.py           # Client class: UDP requests, replies, alerts, ACKs
+│   ├── cli.py              # Command shell (main thread): parses typed commands, calls Client
 │   ├── transfer.py         # Phase 3 P2P attachment transfer over TCP
 │   └── demo_client.py      # Temporary Phase 1 test client
 ├── tests/
@@ -187,7 +188,11 @@ was changed: `common/protocol.py` and `client/demo_client.py` are untouched, and
 - `ALL_CLEAR` carries the message `Incident closed: <reason>` and also reaches every client that received the original `ALERT`.
 - Timers do not survive a restart. On load, deliveries still `PENDING` are rewritten as `UNCONFIRMED_RESTART` and the count is logged.
 
-## Interactive client (`client/client.py`)
+## Interactive client (`client/client.py` + `client/cli.py`)
+
+`client.py` holds the `Client` class (sockets, threads, protocol operations). `cli.py` is the
+command shell: it parses what the user types, calls `Client` methods and prints the results.
+`python -m client.client` still works and starts the shell (same as `python -m client.cli`).
 
 One process = one user. Start the server, then one client per terminal, each on its own UDP port
 (on Windows use `py -3` instead of `python`):

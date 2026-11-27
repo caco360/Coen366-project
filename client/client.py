@@ -27,11 +27,14 @@ import queue
 import shlex
 import socket
 import threading
+from concurrent.futures import ThreadPoolExecutor
+from pathlib import Path
 
 from common import config
 from common.log import get_logger
 from common.net import disable_udp_connreset
 from common.protocol import (
+    FileChecksum,
     MalformedMessage,
     RqCounter,
     build_message,
@@ -42,12 +45,14 @@ from common.protocol import (
 NOTIFICATION_TYPES = {"ALERT", "ALERT_UPDATE", "ALL_CLEAR"}
 REPLY_TIMEOUT = 3.0          # seconds to wait for the server's reply to a request
 NO_REPLY_WAIT = 1.0          # UNSUBSCRIBE / DE-REGISTER: the server only answers on failure
+CHUNK_SIZE = 64 * 1024       # files are read and written in 64 KiB pieces
 
 
 class Client:
 
     def __init__(self, name, role, ip="127.0.0.1", udp_port=6001, tcp_port=None,
-                 server=(config.SERVER_IP, config.SERVER_UDP_PORT), logfile=None):
+                 server=(config.SERVER_IP, config.SERVER_UDP_PORT), logfile=None,
+                 data_dir=config.USER_DATA_DIR):
 
         self.name = name
         self.role = role.upper()
@@ -62,6 +67,19 @@ class Client:
         self.ip, self.udp_port = self.address
         self.tcp_port = tcp_port if tcp_port is not None else self.udp_port + 1000
 
+        # Phase 3: this client's own folder (like its own disk): data/user/<Name>/
+        self.home = Path(data_dir) / name
+        self.shared = self.home / "shared"          # files this client publishes
+        self.downloads = self.home / "downloads"    # verified downloads
+        self.shared.mkdir(parents=True, exist_ok=True)
+        self.downloads.mkdir(parents=True, exist_ok=True)
+
+        # Notes about what this client published: {"INC001": {"file_name", "status"}}.
+        # Saved so a restarted publisher still serves its ACTIVE incidents.
+        self.published_file = self.home / "published.json"
+        self.published = (json.loads(self.published_file.read_text(encoding="utf-8"))
+                          if self.published_file.exists() else {})
+
         self.log = get_logger(f"CENRS.client.{name}.{self.udp_port}", logfile)
         self.log.propagate = False          # don't print twice if the server's root logger exists
 
@@ -75,6 +93,7 @@ class Client:
         self.duplicates = 0
         self.auto_ack = True                # `ack off` simulates a client that never ACKs
 
+        self.tcp = None                     # TCP listening socket (publishers only)
         self.running = False
         self.receiver = threading.Thread(target=self._receive_loop, name="udp-recv", daemon=True)
 
@@ -84,12 +103,27 @@ class Client:
     def start(self):
         self.running = True
         self.receiver.start()
+
+        # Phase 3: publishers serve attachments over TCP. One thread accepts connections,
+        # a pool of TCP_WORKERS threads serves them (same model as the server's UDP workers).
+        if self.role in ("PUBLISHER", "BOTH"):
+            # create_server = bind + listen, with SO_REUSEADDR on Linux/macOS so a restarted
+            # publisher can reuse its port immediately (old connections may be in TIME_WAIT).
+            self.tcp = socket.create_server((self.ip, self.tcp_port))
+            self.tcp_port = self.tcp.getsockname()[1]       # real port if 0 was given (tests)
+            self.tcp_workers = ThreadPoolExecutor(config.TCP_WORKERS,
+                                                  thread_name_prefix="tcp-worker")
+            threading.Thread(target=self._accept_loop, name="tcp-listen", daemon=True).start()
+
         self.log.info("Client %s (%s) on UDP %s:%d, TCP port %d, server %s:%d",
                       self.name, self.role, self.ip, self.udp_port, self.tcp_port, *self.server)
 
     def stop(self):
         self.running = False
         self.sock.close()
+        if self.tcp:
+            self.tcp.close()
+            self.tcp_workers.shutdown(wait=False)
 
     # =========================================================
     # Sending
@@ -143,20 +177,206 @@ class Client:
         return self.request("UNSUBSCRIBE", wait=wait, location=location, category=category)
 
     def publish(self, category, location, severity, title, description, attachment="NONE"):
-        return self.request("PUBLISH_ALERT", category=category, location=location,
-                            severity=severity, title=title, description=description,
-                            attachment=attachment)
+
+        # The attachment must be a plain file name present in our shared/ folder.
+        if attachment != "NONE" and (Path(attachment).name != attachment
+                                     or not (self.shared / attachment).is_file()):
+            raise ValueError(f"{attachment} not found in {self.shared}")
+
+        reply = self.request("PUBLISH_ALERT", category=category, location=location,
+                             severity=severity, title=title, description=description,
+                             attachment=attachment)
+
+        if reply and reply["type"] == "ALERT_ACCEPTED" and attachment != "NONE":
+            self._set_published(reply["incident_id"], file_name=attachment, status="ACTIVE")
+
+        return reply
 
     def update(self, incident_id, severity, title, description):
         return self.request("UPDATE_ALERT", incident_id=incident_id, severity=severity,
                             title=title, description=description)
 
     def close(self, incident_id, reason):
-        return self.request("CLOSE_ALERT", incident_id=incident_id, reason=reason)
+        reply = self.request("CLOSE_ALERT", incident_id=incident_id, reason=reason)
+
+        if reply and reply["type"] == "ALERT_CLOSED" and incident_id in self.published:
+            self._set_published(incident_id, status="CLOSED")
+
+        return reply
+
+    def _set_published(self, incident_id, **fields):
+        """Update our notes about one published incident and save them to published.json."""
+
+        with self.lock:
+            self.published.setdefault(incident_id, {}).update(fields)
+            self.published_file.write_text(json.dumps(self.published, indent=2), encoding="utf-8")
 
     def status(self, incident_id, status):
         return self.request("STATUS_REPORT", incident_id=incident_id, name=self.name,
                             status=status)
+
+    # =========================================================
+    # Subscriber side of P2P transfer: the `attach` command
+    # =========================================================
+    def attach(self, incident_id, file_name):
+        """ATTACH_REQ to the server (UDP), then download from the publisher (TCP).
+
+        Only transfer errors are retried (up to TRANSFER_ATTEMPTS); refusals are reported as-is.
+        Returns one line describing the result.
+        """
+
+        if Path(file_name).name != file_name:
+            return f"invalid file name {file_name}"
+
+        info = self.request("ATTACH_REQ", incident_id=incident_id, file_name=file_name)
+
+        if info is None:
+            return "no reply from server (timeout)"
+        if info["type"] != "ATTACH_INFO":
+            return f"{info['type']} {info['reason']}"          # ATTACH_DENIED: not retried
+
+        attempts = config.TRANSFER_ATTEMPTS
+        for attempt in range(1, attempts + 1):
+            status, detail = self._download(info)
+            if status != "retry":
+                return detail
+            self.log.info("Attempt %d/%d failed: %s", attempt, attempts, detail)
+
+        return f"failed after {attempts} attempts: {detail}"
+
+    def _download(self, info):
+        """One TCP attempt. Returns ("ok" | "refused" | "retry", detail)."""
+
+        incident_id, file_name = info["incident_id"], info["file_name"]
+        part = self.downloads / (file_name + ".part")     # renamed only once the CRC matches
+
+        try:
+            with socket.create_connection((info["ip"], info["tcp_port"]),
+                                          timeout=config.TCP_CONNECT_TIMEOUT) as conn:
+                conn.settimeout(config.TCP_IO_TIMEOUT)
+                rq = self.rq.next()
+                self._send_line(conn, build_message("GET_ATTACHMENT", rq=rq, subscriber_name=self.name,
+                                                    incident_id=incident_id, file_name=file_name))
+
+                stream = conn.makefile("rb")
+                header = decode_message(stream.readline())
+                self.log.info("TCP RECV %s", json.dumps(header, ensure_ascii=False))
+
+                if header["type"] == "ATTACH_ERROR":
+                    return "refused", f"ATTACH_ERROR {header['reason']}"   # publisher said no
+                if header["type"] != "ATTACH_DATA":
+                    return "retry", f"unexpected reply {header['type']}"
+
+                # Read exactly file_size bytes, computing the CRC as we go.
+                checksum = FileChecksum()
+                remaining = header["file_size"]
+                with open(part, "wb") as f:
+                    while remaining:
+                        chunk = stream.read(min(CHUNK_SIZE, remaining))
+                        if not chunk:
+                            break                                    # publisher closed early
+                        f.write(chunk)
+                        checksum.update(chunk)
+                        remaining -= len(chunk)
+
+                if remaining:
+                    error = "Incomplete_Transfer"
+                elif checksum.hexdigest() != header["checksum"]:
+                    error = "Checksum_Mismatch"
+                else:
+                    error = None
+
+                if error:
+                    self._send_line(conn, build_message("ATTACH_ERROR", rq=rq, incident_id=incident_id,
+                                                        file_name=file_name, reason=error))
+                    return "retry", error
+
+                self._send_line(conn, build_message("ATTACH_OK", rq=rq, incident_id=incident_id,
+                                                    file_name=file_name))
+                path = self.downloads / file_name
+                part.replace(path)
+                return "ok", f"saved {path} (CRC {checksum.hexdigest()})"
+
+        except (OSError, MalformedMessage) as error:
+            return "retry", f"{type(error).__name__}: {error}"     # connect failure, timeout, ...
+
+        finally:
+            part.unlink(missing_ok=True)                            # never leave a partial file
+
+    # =========================================================
+    # Publisher side of P2P transfer (tcp-listen + tcp-worker threads)
+    # =========================================================
+    def _accept_loop(self):
+
+        while self.running:
+            try:
+                conn, _ = self.tcp.accept()
+            except OSError:
+                break                                       # socket closed by stop()
+            self.tcp_workers.submit(self._serve, conn)
+
+    def _send_line(self, conn, message):
+        """TCP framing: one JSON message per line."""
+
+        conn.sendall(encode_message(message) + b"\n")
+        self.log.info("TCP SEND %s", json.dumps(message, ensure_ascii=False))
+
+    def _serve(self, conn):
+        """Answer one GET_ATTACHMENT: ATTACH_DATA line + exactly file_size bytes, or ATTACH_ERROR."""
+
+        with conn:
+            try:
+                conn.settimeout(config.TCP_IO_TIMEOUT)
+                stream = conn.makefile("rb")
+
+                request = decode_message(stream.readline())
+                if request["type"] != "GET_ATTACHMENT":
+                    raise MalformedMessage("Expected_GET_ATTACHMENT")
+                self.log.info("TCP RECV %s", json.dumps(request, ensure_ascii=False))
+
+                rq, incident_id, file_name = request["rq"], request["incident_id"], request["file_name"]
+                reason = self._check_request(incident_id, file_name)
+
+                if reason:
+                    self._send_line(conn, build_message("ATTACH_ERROR", rq=rq, incident_id=incident_id,
+                                                        file_name=file_name, reason=reason))
+                    return
+
+                path = self.shared / file_name
+                checksum = FileChecksum()
+                with open(path, "rb") as f:
+                    for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
+                        checksum.update(chunk)
+
+                self.log.info("Serving %s to %s (%s)", file_name, request["subscriber_name"], incident_id)
+                self._send_line(conn, build_message(
+                    "ATTACH_DATA", rq=rq, incident_id=incident_id, file_name=file_name,
+                    file_size=path.stat().st_size, checksum=checksum.hexdigest()))
+
+                with open(path, "rb") as f:
+                    conn.sendfile(f)                        # the raw bytes right after the header
+
+                answer = stream.readline()                  # ATTACH_OK or ATTACH_ERROR
+                self.log.info("TCP RECV %s", answer.decode("utf-8", "replace").strip() or "(closed)")
+
+            except (MalformedMessage, OSError) as error:
+                self.log.warning("TCP transfer aborted: %s", error)
+
+    def _check_request(self, incident_id, file_name):
+        """Publisher-side checks before sending a file. Returns the ATTACH_ERROR reason or None."""
+
+        with self.lock:
+            entry = self.published.get(incident_id)
+
+        if entry is None:
+            return "Unknown_Incident"
+        if entry["status"] != "ACTIVE":
+            return "Incident_Closed"
+        if entry["file_name"] != file_name:
+            return "File_Not_For_Incident"      # also blocks names like ../x: only our own names match
+        if not (self.shared / file_name).is_file():
+            return "File_Not_Available"
+        return None
 
     # =========================================================
     # Receiving (udp-recv thread)
@@ -301,7 +521,8 @@ HELP = """Commands (use quotes for text with spaces):
   update  <INCIDENT_ID> <SEVERITY> "<title>" "<description>"
   close   <INCIDENT_ID> "<reason>"
   status  <INCIDENT_ID> SAFE|NEED_HELP|LEFT_AREA
-  alerts                       incidents this client has received
+  attach  <INCIDENT_ID> <file_name>       download an attachment directly from its publisher
+  alerts                      incidents this client has received
   ack on|off                   off = never ACK (demo of server retransmission)
   raw <json>                   send any text as-is, e.g. raw {"type":"SUBSCRIBE","rq":99}
   help
@@ -374,6 +595,11 @@ def run_command(client, line):
         elif command == "status":
             _expect(args, 2, usage="status <INCIDENT_ID> SAFE|NEED_HELP|LEFT_AREA")
             reply = client.status(upper[0], upper[1])
+
+        elif command == "attach":
+            _expect(args, 2, usage="attach <INCIDENT_ID> <file_name>")
+            print("->", client.attach(upper[0], args[1]))
+            return True
 
         elif command == "alerts":
             with client.lock:

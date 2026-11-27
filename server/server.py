@@ -17,6 +17,7 @@ from common.protocol import (
     encode_message,
 )
 from server.handlers.acks import AckHandler
+from server.handlers.attachments import AttachmentHandler
 from server.handlers.incidents import IncidentHandlers
 from server.handlers.status import StatusHandler
 from server.reliability import TimerManager
@@ -82,6 +83,8 @@ class EmergencyServer:
             "CLOSE_ALERT": incidents.handle_close,
             "ALERT_ACK": acks.handle_ack,
             "STATUS_REPORT": status.handle_status,
+            # Phase 3
+            "ATTACH_REQ": AttachmentHandler(self.storage).handle_attach_req,
         })
 
     # -----------------------------------

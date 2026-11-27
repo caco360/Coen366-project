@@ -139,7 +139,7 @@ MESSAGE_SCHEMAS = {
     },
     "ATTACH_DATA": {
         "required": {"rq", "incident_id", "file_name", "file_size", "checksum"},
-        "optional": {"data"},
+        "optional": set(),       # the file bytes follow the JSON line on the TCP stream
     },
     "ATTACH_OK": {
         "required": {"rq", "incident_id", "file_name"},
@@ -186,6 +186,19 @@ def next_request_id():
 # =========================
 def crc32_hex(data, running=0):
     return "%08X" % (zlib.crc32(data, running) & 0xFFFFFFFF)
+
+
+class FileChecksum:
+    """File checksum computed chunk by chunk. The only place that knows the algorithm (CRC32)."""
+
+    def __init__(self):
+        self.value = 0
+
+    def update(self, chunk):
+        self.value = zlib.crc32(chunk, self.value)
+
+    def hexdigest(self):
+        return "%08X" % (self.value & 0xFFFFFFFF)
 
 
 # =========================

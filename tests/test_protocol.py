@@ -9,6 +9,7 @@ from common.protocol import (
     validate_message,
     next_request_id,
     crc32_hex,
+    FileChecksum,
     RqCounter,
 )
 
@@ -167,6 +168,18 @@ class TestProtocol(unittest.TestCase):
         decoded = decode_message(data)
         self.assertEqual(decoded["type"], "ALERT_ACK")
         self.assertEqual(decoded["incident_id"], "INC102")
+
+    def test_file_checksum_in_chunks_equals_whole(self):
+        c = FileChecksum()
+        c.update(b"hello ")
+        c.update(b"world")
+        self.assertEqual(c.hexdigest(), crc32_hex(b"hello world"))
+        self.assertEqual(FileChecksum().hexdigest(), "00000000")
+
+    def test_attach_data_has_no_data_field(self):
+        with self.assertRaises(MalformedMessage):
+            build_message("ATTACH_DATA", rq=1, incident_id="INC001", file_name="a",
+                          file_size=1, checksum="00000000", data="x")
 
     def test_status_report_valid(self):
         msg = build_message(

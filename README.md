@@ -2,7 +2,7 @@
 
 **Course:** COEN 366 — Communication Networks and Protocols, Fall 2026  
 **Language:** Python  
-**Current stage:** Phase 1 — UDP registration and subscriptions
+**Current stage:** Phase 3 — attachment discovery and P2P TCP transfer done; `GET_ACTIVE_ALERTS` and recovery still to do
 
 ## Project overview
 
@@ -49,6 +49,9 @@ Coen366-project/
 │   └── storage.py          # JSON-file persistence
 ├── client/
 │   ├── __init__.py
+│   ├── client.py           # Client class: UDP requests, replies, alerts, ACKs
+│   ├── cli.py              # Command shell (main thread): parses typed commands, calls Client
+│   ├── transfer.py         # Phase 3 P2P attachment transfer over TCP
 │   └── demo_client.py      # Temporary Phase 1 test client
 ├── tests/
 │   ├── __init__.py
@@ -185,10 +188,133 @@ was changed: `common/protocol.py` and `client/demo_client.py` are untouched, and
 - `ALL_CLEAR` carries the message `Incident closed: <reason>` and also reaches every client that received the original `ALERT`.
 - Timers do not survive a restart. On load, deliveries still `PENDING` are rewritten as `UNCONFIRMED_RESTART` and the count is logged.
 
+## Interactive client (`client/client.py` + `client/cli.py`)
+
+`client.py` holds the `Client` class (sockets, threads, protocol operations). `cli.py` is the
+command shell: it parses what the user types, calls `Client` methods and prints the results.
+`python -m client.client` still works and starts the shell (same as `python -m client.cli`).
+
+One process = one user. Start the server, then one client per terminal, each on its own UDP port
+(on Windows use `py -3` instead of `python`):
+
+```bash
+python -m server.server
+python -m client.client --name CampusSecurity --role PUBLISHER --port 6001
+python -m client.client --name Alice --role SUBSCRIBER --port 6002
+python -m client.client --name Bob --role BOTH --port 6003 --log bob.log
+```
+
+Options: `--tcp-port` (default UDP port + 1000), `--ip`, `--server-ip`, `--server-port`,
+`--log FILE`, `--auto-register`. Type `help` at the prompt:
+
+```text
+register | deregister
+sub HALL FIRE | unsub HALL FIRE
+publish FIRE HALL CRITICAL "Fire alarm" "Evacuate the building" evacuation_map.pdf
+update INC001 WARNING "Fire contained" "Stay outside"
+close INC001 "Resolved"
+status INC001 SAFE
+attach INC001 evacuation_map.pdf   download an attachment from its publisher (Phase 3)
+alerts            incidents received so far
+ack off | ack on  stop/resume ACKs, to demo server retransmission and UNCONFIRMED
+raw <json>        send any text as-is (malformed-message tests)
+quit              exit without de-registering
+```
+
+Each client is multi-threaded: the **main thread** reads commands and waits for the reply with
+the matching RQ#, while a **`udp-recv` thread** receives everything at any time. For `ALERT`,
+`ALERT_UPDATE` and `ALL_CLEAR` it checks `(Incident_ID, Version)` for duplicates (a duplicate is
+logged, not displayed again) and sends `ALERT_ACK` with the same RQ# for `CRITICAL` messages and
+every `ALL_CLEAR`, including for duplicates. The log shows the thread name on each line.
+
+Windows note: the server and client sockets disable `SIO_UDP_CONNRESET`
+(`common/net.py`). Without it, sending an alert to a client that had quit made the
+server's next `recvfrom` raise WinError 10054 and the server stopped.
+
 ### Commands
 
 ```bash
-python -m unittest discover -s tests -v     # 29 tests
+python -m unittest discover -s tests -v     # 58 tests
 python -m tests.run_phase2_demo             # server + publisher + two subscribers, in one process
-python -m server.server                     # manual run; drive it with client/phase2_test_client.py
+python -m server.server                     # manual run; drive it with client/client.py
 ```
+
+## Phase 3 — Attachments: discovery (UDP) and direct P2P transfer (TCP)
+
+The server never stores or relays files. It only tells a subscriber where the publisher is;
+the file then goes **directly from the publisher to the subscriber over TCP**.
+
+### Try it
+
+```bash
+python -m server.server
+python -m client.client --name CampusSecurity --role PUBLISHER --port 6001
+python -m client.client --name Alice --role SUBSCRIBER --port 6002
+```
+
+1. Put a file in `data/user/CampusSecurity/shared/` (e.g. `evacuation_map.pdf`).
+2. Publisher: `register`, then `publish FIRE HALL CRITICAL "Fire" "Evacuate" evacuation_map.pdf`
+3. Alice: `register`, then `attach INC001 evacuation_map.pdf`
+4. The file appears in `data/user/Alice/downloads/`.
+
+### Each client's folder (`data/user/<Name>/`, git-ignored)
+
+```text
+data/user/CampusSecurity/
+  shared/           files this client can publish as attachments
+  downloads/        verified downloads (a download is written as <file>.part and renamed only when the CRC matches)
+  published.json    the publisher's notes: {"INC001": {"file_name": "evacuation_map.pdf", "status": "ACTIVE"}}
+```
+
+`published.json` is updated on `ALERT_ACCEPTED` and `ALERT_CLOSED`, and reloaded at startup, so a
+restarted publisher keeps serving its ACTIVE incidents. `publish` is refused locally if the
+attachment is not a plain file name present in `shared/`.
+
+### Message flow
+
+```
+Alice ── ATTACH_REQ (UDP) ──► Server      checks: Not_Registered, Unknown_Incident, Incident_Closed,
+Alice ◄── ATTACH_INFO / ATTACH_DENIED ──  File_Not_For_Incident, Publisher_Unavailable (not registered this run)
+
+Alice ── TCP connect ──► CampusSecurity (its registered TCP port)
+      ── GET_ATTACHMENT ──►               checks: Unknown_Incident, Incident_Closed,
+      ◄── ATTACH_DATA header + bytes ──   File_Not_For_Incident, File_Not_Available (else ATTACH_ERROR)
+      ── ATTACH_OK / ATTACH_ERROR ──►     then the connection is closed (one request per connection)
+```
+
+### TCP framing
+
+Every TCP message is one JSON object followed by `\n` (JSON never contains a raw newline).
+`ATTACH_DATA` is followed immediately by exactly `file_size` raw bytes:
+
+```
+{"type": "ATTACH_DATA", "rq": 4, "incident_id": "INC001", "file_name": "evacuation_map.pdf", "file_size": 300000, "checksum": "B4879384"}\n
+<300000 raw bytes>
+```
+
+### Integrity and retries
+
+- Checksum: CRC32 (8 hex chars) computed chunk by chunk with `FileChecksum` in `common/protocol.py`,
+  the only place that knows the algorithm.
+- Transfer errors are retried, up to 3 attempts, each on a new connection: connection
+  refused/timeout, `Incomplete_Transfer`, `Checksum_Mismatch`.
+- Refusals are reported and not retried: `ATTACH_DENIED` from the server, `ATTACH_ERROR` from the publisher.
+- Timeouts: 5 s to connect, 10 s without data (`common/config.py`).
+
+### Concurrency at the publisher
+
+A PUBLISHER/BOTH client runs a `tcp-listen` thread (`accept()`) and hands each connection to a
+pool of 8 `tcp-worker` threads (`TCP_WORKERS`), the same model as the server's UDP workers.
+Transfers never block the client's `udp-recv` thread or its command prompt.
+
+### Files
+
+| File | Change |
+|---|---|
+| `server/handlers/attachments.py` | New: `ATTACH_REQ` handler |
+| `server/server.py` | Registers `ATTACH_REQ` |
+| `client/client.py` | User folder, `published.json`, publish check; `start()` and `attach` call into `transfer.py` |
+| `client/transfer.py` | New: subscriber side (`attach`, `download` with retries) and publisher side (`start_listener`, `accept_loop`, `serve`, `check_request`). Each function takes the `Client` as its first argument. |
+| `common/protocol.py` | `FileChecksum`; `ATTACH_DATA` no longer has a `data` field |
+| `common/config.py` | `TCP_WORKERS`, `TCP_CONNECT_TIMEOUT`, `TCP_IO_TIMEOUT`, `TRANSFER_ATTEMPTS`, `USER_DATA_DIR` |
+| `tests/test_attachments.py` | New: 15 tests (server checks, publisher serving, end-to-end, concurrent downloads, bad transfers) |

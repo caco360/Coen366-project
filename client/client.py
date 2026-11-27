@@ -16,7 +16,8 @@ Threads inside ONE client process (spec section 4: the client must be multi-thre
 
 Because the receiver runs on its own thread, an alert that arrives while the user
 is typing, or while another request is waiting for its reply, is ACKed immediately.
-(Phase 3 adds a TCP listener thread for publishers serving attachments.)
+Phase 3 adds a tcp-listen thread + tcp-worker pool for publishers serving attachments;
+that TCP code lives in client/transfer.py.
 
 Type `help` at the prompt for the command list.
 """
@@ -27,14 +28,13 @@ import queue
 import shlex
 import socket
 import threading
-from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+from client import transfer
 from common import config
 from common.log import get_logger
 from common.net import disable_udp_connreset
 from common.protocol import (
-    FileChecksum,
     MalformedMessage,
     RqCounter,
     build_message,
@@ -45,7 +45,6 @@ from common.protocol import (
 NOTIFICATION_TYPES = {"ALERT", "ALERT_UPDATE", "ALL_CLEAR"}
 REPLY_TIMEOUT = 3.0          # seconds to wait for the server's reply to a request
 NO_REPLY_WAIT = 1.0          # UNSUBSCRIBE / DE-REGISTER: the server only answers on failure
-CHUNK_SIZE = 64 * 1024       # files are read and written in 64 KiB pieces
 
 
 class Client:
@@ -104,16 +103,9 @@ class Client:
         self.running = True
         self.receiver.start()
 
-        # Phase 3: publishers serve attachments over TCP. One thread accepts connections,
-        # a pool of TCP_WORKERS threads serves them (same model as the server's UDP workers).
+        # Phase 3: publishers serve attachments over TCP (see client/transfer.py).
         if self.role in ("PUBLISHER", "BOTH"):
-            # create_server = bind + listen, with SO_REUSEADDR on Linux/macOS so a restarted
-            # publisher can reuse its port immediately (old connections may be in TIME_WAIT).
-            self.tcp = socket.create_server((self.ip, self.tcp_port))
-            self.tcp_port = self.tcp.getsockname()[1]       # real port if 0 was given (tests)
-            self.tcp_workers = ThreadPoolExecutor(config.TCP_WORKERS,
-                                                  thread_name_prefix="tcp-worker")
-            threading.Thread(target=self._accept_loop, name="tcp-listen", daemon=True).start()
+            transfer.start_listener(self)
 
         self.log.info("Client %s (%s) on UDP %s:%d, TCP port %d, server %s:%d",
                       self.name, self.role, self.ip, self.udp_port, self.tcp_port, *self.server)
@@ -216,167 +208,10 @@ class Client:
                             status=status)
 
     # =========================================================
-    # Subscriber side of P2P transfer: the `attach` command
+    # Phase 3: attachment transfer over TCP (code in client/transfer.py)
     # =========================================================
     def attach(self, incident_id, file_name):
-        """ATTACH_REQ to the server (UDP), then download from the publisher (TCP).
-
-        Only transfer errors are retried (up to TRANSFER_ATTEMPTS); refusals are reported as-is.
-        Returns one line describing the result.
-        """
-
-        if Path(file_name).name != file_name:
-            return f"invalid file name {file_name}"
-
-        info = self.request("ATTACH_REQ", incident_id=incident_id, file_name=file_name)
-
-        if info is None:
-            return "no reply from server (timeout)"
-        if info["type"] != "ATTACH_INFO":
-            return f"{info['type']} {info['reason']}"          # ATTACH_DENIED: not retried
-
-        attempts = config.TRANSFER_ATTEMPTS
-        for attempt in range(1, attempts + 1):
-            status, detail = self._download(info)
-            if status != "retry":
-                return detail
-            self.log.info("Attempt %d/%d failed: %s", attempt, attempts, detail)
-
-        return f"failed after {attempts} attempts: {detail}"
-
-    def _download(self, info):
-        """One TCP attempt. Returns ("ok" | "refused" | "retry", detail)."""
-
-        incident_id, file_name = info["incident_id"], info["file_name"]
-        part = self.downloads / (file_name + ".part")     # renamed only once the CRC matches
-
-        try:
-            with socket.create_connection((info["ip"], info["tcp_port"]),
-                                          timeout=config.TCP_CONNECT_TIMEOUT) as conn:
-                conn.settimeout(config.TCP_IO_TIMEOUT)
-                rq = self.rq.next()
-                self._send_line(conn, build_message("GET_ATTACHMENT", rq=rq, subscriber_name=self.name,
-                                                    incident_id=incident_id, file_name=file_name))
-
-                stream = conn.makefile("rb")
-                header = decode_message(stream.readline())
-                self.log.info("TCP RECV %s", json.dumps(header, ensure_ascii=False))
-
-                if header["type"] == "ATTACH_ERROR":
-                    return "refused", f"ATTACH_ERROR {header['reason']}"   # publisher said no
-                if header["type"] != "ATTACH_DATA":
-                    return "retry", f"unexpected reply {header['type']}"
-
-                # Read exactly file_size bytes, computing the CRC as we go.
-                checksum = FileChecksum()
-                remaining = header["file_size"]
-                with open(part, "wb") as f:
-                    while remaining:
-                        chunk = stream.read(min(CHUNK_SIZE, remaining))
-                        if not chunk:
-                            break                                    # publisher closed early
-                        f.write(chunk)
-                        checksum.update(chunk)
-                        remaining -= len(chunk)
-
-                if remaining:
-                    error = "Incomplete_Transfer"
-                elif checksum.hexdigest() != header["checksum"]:
-                    error = "Checksum_Mismatch"
-                else:
-                    error = None
-
-                if error:
-                    self._send_line(conn, build_message("ATTACH_ERROR", rq=rq, incident_id=incident_id,
-                                                        file_name=file_name, reason=error))
-                    return "retry", error
-
-                self._send_line(conn, build_message("ATTACH_OK", rq=rq, incident_id=incident_id,
-                                                    file_name=file_name))
-                path = self.downloads / file_name
-                part.replace(path)
-                return "ok", f"saved {path} (CRC {checksum.hexdigest()})"
-
-        except (OSError, MalformedMessage) as error:
-            return "retry", f"{type(error).__name__}: {error}"     # connect failure, timeout, ...
-
-        finally:
-            part.unlink(missing_ok=True)                            # never leave a partial file
-
-    # =========================================================
-    # Publisher side of P2P transfer (tcp-listen + tcp-worker threads)
-    # =========================================================
-    def _accept_loop(self):
-
-        while self.running:
-            try:
-                conn, _ = self.tcp.accept()
-            except OSError:
-                break                                       # socket closed by stop()
-            self.tcp_workers.submit(self._serve, conn)
-
-    def _send_line(self, conn, message):
-        """TCP framing: one JSON message per line."""
-
-        conn.sendall(encode_message(message) + b"\n")
-        self.log.info("TCP SEND %s", json.dumps(message, ensure_ascii=False))
-
-    def _serve(self, conn):
-        """Answer one GET_ATTACHMENT: ATTACH_DATA line + exactly file_size bytes, or ATTACH_ERROR."""
-
-        with conn:
-            try:
-                conn.settimeout(config.TCP_IO_TIMEOUT)
-                stream = conn.makefile("rb")
-
-                request = decode_message(stream.readline())
-                if request["type"] != "GET_ATTACHMENT":
-                    raise MalformedMessage("Expected_GET_ATTACHMENT")
-                self.log.info("TCP RECV %s", json.dumps(request, ensure_ascii=False))
-
-                rq, incident_id, file_name = request["rq"], request["incident_id"], request["file_name"]
-                reason = self._check_request(incident_id, file_name)
-
-                if reason:
-                    self._send_line(conn, build_message("ATTACH_ERROR", rq=rq, incident_id=incident_id,
-                                                        file_name=file_name, reason=reason))
-                    return
-
-                path = self.shared / file_name
-                checksum = FileChecksum()
-                with open(path, "rb") as f:
-                    for chunk in iter(lambda: f.read(CHUNK_SIZE), b""):
-                        checksum.update(chunk)
-
-                self.log.info("Serving %s to %s (%s)", file_name, request["subscriber_name"], incident_id)
-                self._send_line(conn, build_message(
-                    "ATTACH_DATA", rq=rq, incident_id=incident_id, file_name=file_name,
-                    file_size=path.stat().st_size, checksum=checksum.hexdigest()))
-
-                with open(path, "rb") as f:
-                    conn.sendfile(f)                        # the raw bytes right after the header
-
-                answer = stream.readline()                  # ATTACH_OK or ATTACH_ERROR
-                self.log.info("TCP RECV %s", answer.decode("utf-8", "replace").strip() or "(closed)")
-
-            except (MalformedMessage, OSError) as error:
-                self.log.warning("TCP transfer aborted: %s", error)
-
-    def _check_request(self, incident_id, file_name):
-        """Publisher-side checks before sending a file. Returns the ATTACH_ERROR reason or None."""
-
-        with self.lock:
-            entry = self.published.get(incident_id)
-
-        if entry is None:
-            return "Unknown_Incident"
-        if entry["status"] != "ACTIVE":
-            return "Incident_Closed"
-        if entry["file_name"] != file_name:
-            return "File_Not_For_Incident"      # also blocks names like ../x: only our own names match
-        if not (self.shared / file_name).is_file():
-            return "File_Not_Available"
-        return None
+        return transfer.attach(self, incident_id, file_name)
 
     # =========================================================
     # Receiving (udp-recv thread)

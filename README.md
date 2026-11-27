@@ -49,6 +49,8 @@ Coen366-project/
 │   └── storage.py          # JSON-file persistence
 ├── client/
 │   ├── __init__.py
+│   ├── client.py           # Interactive client: Client class (UDP) + command shell
+│   ├── transfer.py         # Phase 3 P2P attachment transfer over TCP
 │   └── demo_client.py      # Temporary Phase 1 test client
 ├── tests/
 │   ├── __init__.py
@@ -306,7 +308,8 @@ Transfers never block the client's `udp-recv` thread or its command prompt.
 |---|---|
 | `server/handlers/attachments.py` | New: `ATTACH_REQ` handler |
 | `server/server.py` | Registers `ATTACH_REQ` |
-| `client/client.py` | User folder, `published.json`, publish check, TCP listener + pool, `attach` command |
+| `client/client.py` | User folder, `published.json`, publish check; `start()` and `attach` call into `transfer.py` |
+| `client/transfer.py` | New: subscriber side (`attach`, `download` with retries) and publisher side (`start_listener`, `accept_loop`, `serve`, `check_request`). Each function takes the `Client` as its first argument. |
 | `common/protocol.py` | `FileChecksum`; `ATTACH_DATA` no longer has a `data` field |
 | `common/config.py` | `TCP_WORKERS`, `TCP_CONNECT_TIMEOUT`, `TCP_IO_TIMEOUT`, `TRANSFER_ATTEMPTS`, `USER_DATA_DIR` |
 | `tests/test_attachments.py` | New: 15 tests (server checks, publisher serving, end-to-end, concurrent downloads, bad transfers) |
